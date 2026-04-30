@@ -451,34 +451,65 @@ def create_dashboard_blueprint(conversion_dir: str, run_conversion_outputs):
 
 
 def _run_remediation_safe(error_code: str, description: str, session_id: str = '') -> dict:
-    """Import and run remediation_engine.run_remediation with a safe fallback."""
+    """Import and run remediation_engine.run_remediation. Always returns a valid dict."""
     import os as _os, sys as _sys
 
-    # Add DummyApp/ to sys.path so remediation_engine is importable
+    # Add DummyApp/ to sys.path so remediation_engine and ssl_remediation_agent are importable
     _dummy_dir = _os.path.abspath(
         _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'DummyApp')
     )
     if _dummy_dir not in _sys.path:
         _sys.path.insert(0, _dummy_dir)
 
-    # Resolve the log path for writing RESOLVED lines
+    # Resolve log path for writing RESOLVED lines
     _app_dir  = _os.path.abspath(
         _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'Application')
     )
-    _log_file = _os.environ.get('LOG_FILENAME', 'application.log')
-    _log_path = _os.path.join(_app_dir, 'logs', _log_file)
+    _log_path = _os.path.join(_app_dir, 'logs', _os.environ.get('LOG_FILENAME', 'application.log'))
 
+    # Force reload of remediation_engine to bypass stale __pycache__
     try:
-        from remediation_engine import run_remediation  # type: ignore
-        return run_remediation(error_code, description, log_path=_log_path, session_id=session_id)
+        import importlib
+        import remediation_engine as _re_mod  # type: ignore
+        importlib.reload(_re_mod)
+        run_remediation = _re_mod.run_remediation
+    except Exception as import_exc:
+        return {
+            'success':   False,
+            'steps':     [{'step': f'Could not import remediation_engine: {import_exc}',
+                           'status': 'fail', 'detail': str(import_exc), 'ts': _ts_now()}],
+            'summary':   f'Remediation engine import failed: {import_exc}',
+            'new_state': 'in_progress',
+        }
+
+    # Try calling with session_id first, fall back without if old signature cached
+    try:
+        return run_remediation(
+            error_code, description,
+            log_path=_log_path,
+            session_id=session_id,
+        )
+    except TypeError:
+        # Old cached version without session_id parameter — call without it
+        try:
+            return run_remediation(error_code, description, log_path=_log_path)
+        except Exception as exc:
+            return {
+                'success':   False,
+                'steps':     [{'step': f'Remediation failed: {exc}',
+                               'status': 'fail', 'detail': str(exc), 'ts': _ts_now()}],
+                'summary':   f'Automated remediation error: {exc}',
+                'new_state': 'in_progress',
+            }
     except Exception as exc:
         return {
             'success':   False,
-            'steps':     [{'step': f'Remediation engine failed to load: {exc}',
+            'steps':     [{'step': f'Remediation failed: {exc}',
                            'status': 'fail', 'detail': str(exc), 'ts': _ts_now()}],
-            'summary':   f'Automated remediation unavailable: {exc}',
+            'summary':   f'Automated remediation error: {exc}',
             'new_state': 'in_progress',
         }
+
 
 
 def _build_work_note(remediation: dict, bedrock_plan: str) -> str:
